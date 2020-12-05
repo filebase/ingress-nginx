@@ -452,6 +452,7 @@ WITH_FLAGS="--with-debug \
   --with-http_addition_module \
   --with-http_geoip_module \
   --with-http_gzip_static_module \
+  --with-http_slice_module \
   --with-http_sub_module \
   --with-http_v2_module \
   --with-stream \
