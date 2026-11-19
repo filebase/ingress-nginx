@@ -1,0 +1,62 @@
+name: Filebase patched ingress image
+on:
+  push:
+    branches: ['security/nginx2root-*']
+    paths: ['filebase/**', 'images/nginx/**', '.github/workflows/filebase-security-image.yaml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: filebase-security-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  nginx-tests:
+    if: github.repository == 'filebase/ingress-nginx'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Run pinned NGINX tests with AddressSanitizer
+        run: make -C images/nginx test
+
+  image:
+    if: github.repository == 'filebase/ingress-nginx'
+    needs: nginx-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch reviewed patch source
+        run: git fetch --no-tags https://github.com/chainguard-forks/ingress-nginx.git 29e7c87140a9d88ffd3cf26ff07852bb81dc0a4a
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
+        with:
+          go-version: '1.26.1'
+          cache: false
+      - name: Verify controller configuration code
+        run: |
+          go test ./internal/ingress/controller/template
+          go test -c -o /tmp/filebase-flags.test ./pkg/flags
+          # Flag tests bind ports 80/443. Isolate them from runner services and
+          # grant the low-port privilege without changing the controller code.
+          sudo unshare --net -- sh -c 'ip link set lo up; exec /tmp/filebase-flags.test'
+      - name: Authenticate to Filebase registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build and publish candidate
+        run: bash filebase/build-security-image.sh publish
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: filebase-build-provenance
+          path: .cache/filebase/
