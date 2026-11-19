@@ -1,8 +1,7 @@
 name: Filebase patched ingress image
 on:
   push:
-    branches: ['security/nginx2root-*']
-    paths: ['filebase/**', 'images/nginx/**', '.github/workflows/filebase-security-image.yaml']
+    branches: ['**']
   workflow_dispatch:
 
 permissions:

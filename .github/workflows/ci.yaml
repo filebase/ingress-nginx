@@ -176,9 +176,8 @@ jobs:
           chmod +x ./kubectl
           sudo mv ./kubectl /usr/local/bin/kubectl
 
+      # Always build the patched base from this checkout; its tag is not published upstream.
       - name: Build NGINX Base image
-        if: |
-          needs.changes.outputs.baseimage == 'true'
         run: |
             export TAG=$(cat images/nginx/TAG)
             cd images/nginx/rootfs && docker buildx build --platform=${{ env.PLATFORMS }} --load -t registry.k8s.io/ingress-nginx/nginx:${TAG} .
