@@ -44,7 +44,12 @@ jobs:
           go-version: '1.26.1'
           cache: false
       - name: Verify controller configuration code
-        run: go test ./internal/ingress/controller/template ./pkg/flags
+        run: |
+          go test ./internal/ingress/controller/template
+          go test -c -o /tmp/filebase-flags.test ./pkg/flags
+          # Flag tests bind ports 80/443. Isolate them from runner services and
+          # grant the low-port privilege without changing the controller code.
+          sudo unshare --net -- sh -c 'ip link set lo up; exec /tmp/filebase-flags.test'
       - name: Authenticate to Filebase registry
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
