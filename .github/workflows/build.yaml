@@ -1,0 +1,207 @@
+# Builds the ingress-nginx controller image used by the Filebase Helm chart.
+#
+# - Pull requests: build and smoke-test the image, nothing is pushed.
+# - Pushes to any branch or tag, and manual runs: build, smoke-test and push
+#   to ghcr.io/filebase/ingress-nginx/controller.
+#
+# If NGINX_BASE points at a ghcr.io/filebase/* image, the NGINX base image is
+# built from images/nginx/rootfs first (cached between runs) and the controller
+# is built on top of that fresh build. Otherwise the upstream base is pulled.
+name: Build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CONTROLLER_IMAGE: ghcr.io/filebase/ingress-nginx/controller
+  PLATFORM: linux/amd64
+  PUSH: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  controller:
+    name: Controller image
+    if: github.repository == 'filebase/ingress-nginx'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+
+    # Local registry so a freshly built NGINX base can be used as the
+    # controller's FROM image without publishing it first.
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: GOLANG_VERSION
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          driver-opts: network=host
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        id: meta
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          REF_NAME: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(cat TAG)
+          short=${HEAD_SHA::7}
+          ref_slug=$(printf '%s' "$REF_NAME" | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's/[^a-z0-9._-]+/-/g; s/^[.-]+//' | cut -c1-120)
+
+          base=$(cat NGINX_BASE)
+          if [[ "$base" == ghcr.io/filebase/* ]]; then
+            build_base=true
+            base_tag=${base%@*}
+            base_ref=localhost:5000/nginx-base:build
+          else
+            build_base=false
+            base_tag=
+            base_ref=$base
+          fi
+
+          {
+            echo "version=$version"
+            echo "commit=$HEAD_SHA"
+            echo "image_tag=$version-$short"
+            echo "tags<<EOF"
+            echo "$CONTROLLER_IMAGE:$version-$short"
+            echo "$CONTROLLER_IMAGE:$ref_slug"
+            echo "EOF"
+            echo "build_base=$build_base"
+            echo "base_tag=$base_tag"
+            echo "base_ref=$base_ref"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build NGINX base image
+        if: steps.meta.outputs.build_base == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: images/nginx/rootfs
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: |
+            localhost:5000/nginx-base:build
+            ${{ env.PUSH == 'true' && steps.meta.outputs.base_tag || '' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.commit }}
+          cache-from: type=gha,scope=nginx-base
+          cache-to: type=gha,scope=nginx-base,mode=max
+
+      - name: Build controller binaries
+        env:
+          PKG: k8s.io/ingress-nginx
+          ARCH: amd64
+          COMMIT_SHA: ${{ steps.meta.outputs.commit }}
+          REPO_INFO: https://github.com/${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.version }}
+        run: bash build/build.sh
+
+      - name: Build controller image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: rootfs
+          platforms: ${{ env.PLATFORM }}
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            BASE_IMAGE=${{ steps.meta.outputs.base_ref }}
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT_SHA=${{ steps.meta.outputs.commit }}
+            BUILD_ID=${{ github.run_id }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.vendor=Filebase
+
+      - name: Smoke test controller image
+        env:
+          IMAGE: ${{ env.CONTROLLER_IMAGE }}:${{ steps.meta.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          docker run --rm "$IMAGE" /nginx-ingress-controller --version
+          docker run --rm "$IMAGE" nginx -V
+          docker run --rm "$IMAGE" sh -ec 'test "$(id -u)" = 101; test -x /wait-shutdown; test -d /etc/nginx/template'
+
+      - name: Push controller image
+        id: push
+        if: env.PUSH == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: rootfs
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            BASE_IMAGE=${{ steps.meta.outputs.base_ref }}
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT_SHA=${{ steps.meta.outputs.commit }}
+            BUILD_ID=${{ github.run_id }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.vendor=Filebase
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          BASE_REF: ${{ steps.meta.outputs.base_ref }}
+          BASE_TAG: ${{ steps.meta.outputs.base_tag }}
+        run: |
+          {
+            echo "## Controller image"
+            if [[ "$PUSH" == "true" ]]; then echo "Pushed:"; else echo "Built (not pushed, pull request):"; fi
+            echo '```'
+            echo "$TAGS"
+            [[ -n "$DIGEST" ]] && echo "digest: $DIGEST"
+            echo '```'
+            echo "NGINX base: \`${BASE_TAG:-$BASE_REF}\`"
+            if [[ "$PUSH" == "true" ]]; then
+              echo
+              echo "### Helm values"
+              echo '```yaml'
+              echo 'controller:'
+              echo '  image:'
+              echo '    registry: ghcr.io'
+              echo '    image: filebase/ingress-nginx/controller'
+              echo "    tag: $IMAGE_TAG"
+              echo "    digest: $DIGEST"
+              echo '    digestChroot: ""'
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
