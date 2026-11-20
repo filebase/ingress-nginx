@@ -156,6 +156,22 @@ jobs:
           docker run --rm "$IMAGE" nginx -V
           docker run --rm "$IMAGE" sh -ec 'test "$(id -u)" = 101; test -x /wait-shutdown; test -d /etc/nginx/template'
 
+          # Load every dynamic module and resty.core (http + stream) so NGINX
+          # ABI breaks or lua-nginx-module/lua-resty-core mismatches fail here
+          # instead of at pod startup.
+          docker run --rm "$IMAGE" bash -ec '
+            conf=/tmp/smoke.conf
+            for m in /etc/nginx/modules/*.so; do echo "load_module $m;"; done > "$conf"
+            cat >> "$conf" <<EOF
+          pid /tmp/smoke.pid;
+          error_log stderr notice;
+          events {}
+          http { init_by_lua_block { require "resty.core" } }
+          stream { init_by_lua_block { require "resty.core" } }
+          EOF
+            nginx -t -c "$conf"
+          '
+
       - name: Push controller image
         id: push
         if: env.PUSH == 'true'
